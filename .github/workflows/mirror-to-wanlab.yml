@@ -40,10 +40,21 @@ jobs:
           chmod 600 ~/.ssh/mirror_key
           ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Force-push main and tags to wan-mlab/PRIME
+      - name: Force-push (workflow files stripped) to wan-mlab/PRIME
         env:
           GIT_SSH_COMMAND: "ssh -i ~/.ssh/mirror_key -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/known_hosts"
         run: |
           git remote add wanlab git@github.com:wan-mlab/PRIME.git
-          git push wanlab main --force
+          git config user.email "mirror-action@users.noreply.github.com"
+          git config user.name "PRIME mirror bot"
+
+          # GitHub blocks deploy keys from pushing workflow-file changes.
+          # We strip .github/workflows from the tip with one extra commit
+          # before mirroring; the rest of the history is unchanged.
+          if [ -d .github/workflows ]; then
+            git rm -rf .github/workflows
+            git commit -m "[mirror] strip workflow files (deploy-key cannot push them)"
+          fi
+
+          git push wanlab HEAD:main --force
           git push wanlab --tags --force
