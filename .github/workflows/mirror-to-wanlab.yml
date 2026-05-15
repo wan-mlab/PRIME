@@ -1,0 +1,49 @@
+name: Mirror to wan-mlab/PRIME
+
+# Keeps wan-mlab/PRIME in sync with this repo by force-pushing main
+# (and all tags) after every push to main. Also exposes a manual trigger
+# from the Actions tab.
+#
+# Auth: SSH deploy key, stored as the secret WANLAB_DEPLOY_KEY. The matching
+# public key is registered on wan-mlab/PRIME with write access.
+
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-to-wanlab
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure SSH deploy key
+        env:
+          DEPLOY_KEY: ${{ secrets.WANLAB_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/mirror_key
+          chmod 600 ~/.ssh/mirror_key
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Force-push main and tags to wan-mlab/PRIME
+        env:
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/mirror_key -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/known_hosts"
+        run: |
+          git remote add wanlab git@github.com:wan-mlab/PRIME.git
+          git push wanlab main --force
+          git push wanlab --tags --force
