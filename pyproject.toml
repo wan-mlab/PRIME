@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prime-sc"
-version = "0.1.0"
+version = "0.2.0"
 description = "PRIME: Projection-based Robust Integration via Manifold Embedding — batch effect correction for scRNA-seq and spatial transcriptomics"
 readme = "README.md"
 license = { text = "MIT" }
@@ -50,6 +50,15 @@ plotting = [
 ]
 metrics = [
     "joblib>=1.1",
+]
+# GPU backends — install one of these alongside a cupy build that matches
+# your CUDA version (cupy-cuda12x, cupy-cuda11x, etc.). cupy is not pinned
+# here because the right wheel is CUDA-version specific.
+gpu-cuvs = [
+    "cuvs-cu12>=24.10",
+]
+gpu-faiss = [
+    "faiss-gpu>=1.7",
 ]
 all = [
     "matplotlib>=3.5",

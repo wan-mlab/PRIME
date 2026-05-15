@@ -203,6 +203,104 @@ where `L_anchor` is the Laplacian of the consensus MNN anchor graph, `L_spatial`
 
 ---
 
+## Scaling to 1M+ cells
+
+PRIME ships two optional subpackages that lift the usual RAM and VRAM bottlenecks at large scale.
+
+### `prime.pp` — streaming preprocessing (no full matrix in RAM)
+
+The most common reason scanpy preprocessing blows up on 1M+ cells is the HVG step: `sc.pp.highly_variable_genes(flavor="seurat_v3")` can silently densify intermediates. `prime.pp.streaming_hvg` solves this with two streaming passes over backed-mode AnnData, using only `O(n_genes × n_batches)` extra memory regardless of the cell count.
+
+```python
+import prime
+
+# Works on either an in-memory AnnData or a path to an .h5ad file.
+hvg_mask = prime.pp.streaming_hvg(
+    "huge_dataset.h5ad",   # backed-mode read; peak memory ~ 1 chunk worth
+    batch_key="batch",
+    n_top_genes=3000,
+    chunk_size=20_000,
+    min_cells=10,
+    aggregation="median_rank",   # Seurat-v3-style cross-batch rank aggregation
+)
+# hvg_mask is a bool array of shape (n_genes,)
+```
+
+For a quick "drop the sparsely-expressed genes" pass that doesn't even need normalization:
+
+```python
+keep = prime.pp.streaming_gene_filter("huge_dataset.h5ad", min_cells=10)
+```
+
+### `prime.gpu.ensemble_mnn_correct` — GPU backend, VRAM-bounded
+
+The GPU version of `ensemble_mnn_correct` integrates the techniques needed to keep 1M cells well under 16 GB of VRAM:
+
+| Technique | Implementation |
+|-----------|----------------|
+| Never densify X | Sparse CSR on GPU via cuSPARSE matmul |
+| Approximate kNN, batched queries | cuvs CAGRA (or faiss-gpu), `knn_chunk_size` rows per call |
+| Mixed precision | `projection_dtype="float16"` for the projection / kNN intermediate |
+| Free pool between projections | Explicit `cp.get_default_memory_pool().free_all_blocks()` each iteration |
+| CPU correction step | Gene-chunked additive update — already RAM-bounded by `chunk_size` |
+
+```python
+import prime
+import prime.gpu
+
+# Inspect which backends are available before running:
+print(prime.gpu.detect())
+# GPUEnv(cupy=True, cupy_sparse=True, cuvs=True, faiss_gpu=False)
+
+X_corrected = prime.gpu.ensemble_mnn_correct(
+    adata,
+    batch_key="batch",
+    n_projections=10,
+    target_dim=50,
+    k_neighbors=20,
+    consensus_threshold=0.4,
+    knn_chunk_size=50_000,        # cap query VRAM
+    knn_backend="auto",           # "cuvs" preferred, falls back to "faiss"
+    projection_dtype="float16",   # half the projection VRAM
+    chunk_size=2000,              # CPU correction chunking
+)
+adata.layers["prime_gpu"] = X_corrected
+```
+
+**Installation.** Install the matching cupy wheel for your CUDA version plus one ANN backend:
+
+```bash
+pip install cupy-cuda12x
+pip install "prime-sc[gpu-cuvs]"     # recommended
+# or
+pip install "prime-sc[gpu-faiss]"
+```
+
+### Typical end-to-end pipeline for 1M cells
+
+```python
+import scanpy as sc
+import prime
+
+# 1) Streaming HVG straight from disk — no full matrix loaded.
+hvg = prime.pp.streaming_hvg("data.h5ad", batch_key="batch", n_top_genes=3000)
+
+# 2) Load only the HVG slice into RAM.
+adata = sc.read_h5ad("data.h5ad", backed="r")
+adata = adata[:, hvg].to_memory()
+
+# 3) Run PRIME on GPU.
+X_corrected = prime.gpu.ensemble_mnn_correct(adata, batch_key="batch")
+adata.X = X_corrected
+
+# 4) Downstream as usual.
+sc.pp.pca(adata, n_comps=50)
+sc.pp.neighbors(adata)
+sc.tl.umap(adata)
+```
+
+---
+
 ## Evaluation metrics
 
 PRIME ships with two evaluation utilities useful for benchmarking integration quality.
@@ -263,8 +361,14 @@ Requires the optional `plotting` extras: `pip install -e ".[plotting]"`.
 
 ```
 prime/
-├── core.py         # ensemble_mnn_correct (scRNA-seq)
-├── spatial.py      # prime_st (spatial transcriptomics)
+├── core.py         # ensemble_mnn_correct (scRNA-seq, CPU)
+├── spatial.py      # prime_st (spatial transcriptomics, CPU)
+├── pp/
+│   └── streaming.py      # streaming_hvg, streaming_gene_filter
+├── gpu/
+│   ├── ensemble.py       # GPU ensemble_mnn_correct (VRAM-bounded)
+│   ├── _knn.py           # chunked cuvs / faiss-gpu ANN wrapper
+│   └── _backend.py       # lazy GPU backend detection
 ├── metrics/
 │   ├── xlc.py            # ordinal_layer_continuity, xlc_score
 │   └── isolated_label.py # compute_isolated_label_scores, ...
