@@ -117,3 +117,35 @@ def free_pool() -> None:
         cp.get_default_pinned_memory_pool().free_all_blocks()
     except Exception:
         pass
+
+
+def is_oom_error(exc: BaseException) -> bool:
+    """Heuristically decide whether ``exc`` is a GPU out-of-memory error.
+
+    Recognizes cupy's ``OutOfMemoryError`` (the default cuvs/cupy path),
+    RMM / ``MemoryError`` allocation failures, and faiss' ``RuntimeError``
+    whose message reports a failed allocation. Anything else should be treated
+    as a genuine bug and re-raised, not retried — hence this is intentionally
+    conservative about what counts as OOM.
+    """
+    # cupy.cuda.memory.OutOfMemoryError subclasses MemoryError, and most RMM
+    # allocation failures raise MemoryError too, so this covers the common path.
+    if isinstance(exc, MemoryError):
+        return True
+    try:
+        import cupy as cp
+
+        if isinstance(exc, cp.cuda.memory.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    # faiss-gpu surfaces allocation failures as RuntimeError; match on message.
+    msg = str(exc).lower()
+    needles = (
+        "out of memory",
+        "outofmemory",
+        "cudaerrormemoryallocation",
+        "failed to allocate",
+        "bad_alloc",
+    )
+    return any(s in msg for s in needles)

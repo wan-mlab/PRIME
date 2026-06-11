@@ -24,7 +24,7 @@ from anndata import AnnData
 from scipy import sparse
 
 from prime.core import _compute_smoothing_matrix
-from prime.gpu._backend import free_pool, require_ann
+from prime.gpu._backend import free_pool, is_oom_error, require_ann
 from prime.gpu._knn import chunked_knn, mutual_neighbors
 
 
@@ -320,19 +320,38 @@ def ensemble_mnn_correct(
 
     batch_labels = adata.obs[batch_key].values
 
-    consensus = _gpu_consensus_graph(
-        adata.X,
-        batch_labels,
-        n_projections=n_projections,
-        target_dim=target_dim,
-        k_neighbors=k_neighbors,
-        consensus_threshold=consensus_threshold,
-        knn_chunk_size=knn_chunk_size,
-        knn_backend=knn_backend,
-        projection_dtype=projection_dtype,
-        random_state=random_state,
-        verbose=verbose,
-    )
+    try:
+        consensus = _gpu_consensus_graph(
+            adata.X,
+            batch_labels,
+            n_projections=n_projections,
+            target_dim=target_dim,
+            k_neighbors=k_neighbors,
+            consensus_threshold=consensus_threshold,
+            knn_chunk_size=knn_chunk_size,
+            knn_backend=knn_backend,
+            projection_dtype=projection_dtype,
+            random_state=random_state,
+            verbose=verbose,
+        )
+    except Exception as exc:  # noqa: BLE001 — re-raised below unless OOM
+        # Reclaim whatever VRAM we can so the caller can retry with smaller
+        # settings (or fall back to the CPU path) in the same process.
+        free_pool()
+        if is_oom_error(exc):
+            raise MemoryError(
+                "prime.gpu.ensemble_mnn_correct ran out of GPU memory while "
+                "building the consensus graph. The kNN step already backs off "
+                "its chunk size automatically, so the bottleneck is most likely "
+                "the sparse expression matrix or a single random projection "
+                "living on the GPU. Try: lower target_dim "
+                f"(currently {target_dim}) or k_neighbors (currently "
+                f"{k_neighbors}); keep projection_dtype='float16'; subset to "
+                "highly-variable genes before calling; or use a larger-VRAM "
+                "GPU. The CPU equivalent prime.ensemble_mnn_correct has no VRAM "
+                "limit and produces an equivalent result."
+            ) from exc
+        raise
     if verbose:
         print(f"[prime.gpu] consensus graph: {consensus.nnz} edges")
 

@@ -1,0 +1,52 @@
+# PRIME — CPU / base conda environment
+#
+# Reproduces the runtime PRIME is developed and tested against (captured
+# 2026-06, Python 3.12). Works on Linux, macOS and Windows. Create it with
+# either conda or mamba, from a clone of the repository:
+#
+#     git clone https://github.com/XinchaoWu99/PRIME.git
+#     cd PRIME
+#     conda env create -f environment.yml      # or: mamba env create -f environment.yml
+#     conda activate prime
+#
+# Every runtime dependency is pulled from conda-forge; the final `-e .` then
+# installs PRIME itself in editable mode, so `import prime` works immediately.
+# (Run the command from the repository root so that `.` resolves to this repo.)
+#
+# For the optional NVIDIA GPU backend, use environment-gpu.yml instead.
+#
+# Tested-with versions (2026-06): python 3.12.11, numpy 2.4.6, pandas 2.3.3,
+# scipy 1.17.1, scikit-learn 1.9.0, anndata 0.12.16, scanpy 1.12.1,
+# matplotlib 3.10.9, joblib 1.5.3, plottable 0.1.5, pytest 9.0.3, ruff 0.15.17.
+
+name: prime
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.12
+
+  # ---- PRIME core runtime (required) ----
+  - numpy>=1.24
+  - pandas>=2.0
+  - scipy>=1.11
+  - scikit-learn>=1.3
+  - anndata>=0.10
+  - scanpy>=1.10
+  - h5py>=3.0             # backed-mode .h5ad I/O for prime.pp streaming (also an anndata dep)
+  - scikit-misc>=0.3      # required by prime_st's default hvg_flavor="seurat_v3" (scanpy HVG)
+
+  # ---- optional: plotting + evaluation-metrics extras ----
+  - matplotlib>=3.7
+  - joblib>=1.3
+
+  # ---- optional: development / test tooling ----
+  - pytest>=7.0
+  - ruff>=0.5
+
+  # ---- pip-only deps + PRIME itself ----
+  - pip>=23
+  - pip:
+      - plottable>=0.1.5      # styled benchmark tables; not packaged on conda-forge
+      - -e .                  # install PRIME (editable); run from the repo root

@@ -77,6 +77,27 @@ def _svd_embedding(X: csr_matrix, n_comps: int, random_state: int = 0) -> np.nda
     return Z.astype(np.float32)
 
 
+def _random_projection_embedding(
+    X,
+    n_components: int,
+    random_state: int,
+) -> np.ndarray:
+    """Gaussian random-projection embedding.
+
+    A single dense embedding produced by multiplying X with a Gaussian random
+    matrix R (entries ~ N(0, 1 / n_components), as drawn by scikit-learn). By
+    the Johnson-Lindenstrauss lemma this approximately preserves pairwise
+    Euclidean distances, which is exactly the property distance-based methods
+    such as MNN rely on. Sparse-friendly: ``fit_transform`` accepts a CSR X and
+    returns a dense ``(n_obs, n_components)`` array.
+    """
+    rp = GaussianRandomProjection(
+        n_components=n_components,
+        random_state=random_state,
+    )
+    return rp.fit_transform(X).astype(np.float32)
+
+
 # ============================================================
 # 2. MNN (Mutual Nearest Neighbors) helpers
 # ============================================================
@@ -165,6 +186,90 @@ def _multibatch_mnn_edges(
         return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
 
     return np.concatenate(rows), np.concatenate(cols)
+
+
+def _build_rp_consensus_mnn_graph(
+    X_log_hvg: csr_matrix,
+    batch_labels: np.ndarray,
+    *,
+    n_projections: int,
+    rp_dim: int,
+    k_mnn: int,
+    consensus_threshold: float,
+    mnn_strategy: str,
+    n_jobs: int,
+    random_state: int,
+) -> csr_matrix:
+    """Ensemble random-projection + consensus-MNN anchor graph.
+
+    This is the reusable implementation of the PRIME "ERP consensus MNN" step,
+    the spatial counterpart of :func:`prime.core.build_consensus_graph` and
+    :func:`prime.gpu.ensemble._gpu_consensus_graph`. The principle, end to end:
+
+    1. L2-normalize each cell's expression row, so kNN compares *profiles*
+       (cosine-like geometry) rather than library size.
+    2. Draw ``n_projections`` independent Gaussian random projections, each to
+       ``rp_dim`` dimensions, with seeds ``random_state + t``. The
+       Johnson-Lindenstrauss lemma guarantees each projection approximately
+       preserves pairwise distances, so MNNs found in the low-dimensional
+       projection match those in the full space, far more cheaply.
+    3. In every projection, find cross-batch mutual nearest neighbours.
+    4. Vote: an edge's consensus weight is the fraction of projections in which
+       it appeared (``count / n_projections``).
+    5. Keep edges whose frequency ``>= consensus_threshold``; symmetrize.
+
+    Returns a symmetric CSR anchor graph with no self-loops, whose edge weights
+    are consensus frequencies in ``[consensus_threshold, 1]``.
+    """
+    n = X_log_hvg.shape[0]
+
+    # 1) L2-normalize rows (keeps the matrix sparse).
+    X_norm = normalize(X_log_hvg, axis=1)
+
+    # 2-3) Ensemble of projections; collect cross-batch MNN edges per projection.
+    #       Edges are encoded as flat int64 keys (r * n + c) for fast voting.
+    keys_all = []
+    for t in range(n_projections):
+        Xp = _random_projection_embedding(X_norm, rp_dim, random_state + t)
+        r, c = _multibatch_mnn_edges(
+            Xp, batch_labels,
+            k=k_mnn, strategy=mnn_strategy, n_jobs=n_jobs,
+        )
+        if r.size > 0:
+            keys_all.append(r.astype(np.int64) * n + c.astype(np.int64))
+
+    if not keys_all:
+        raise RuntimeError(
+            "No MNN edges found across projections. "
+            "Try increasing k_mnn, lowering consensus_threshold, "
+            "or using mnn_strategy='pairwise'."
+        )
+
+    # 4) Consensus voting: frequency = (#projections that voted) / n_projections.
+    all_keys = np.concatenate(keys_all)
+    uniq_keys, counts = np.unique(all_keys, return_counts=True)
+    freq = counts.astype(np.float32) / float(n_projections)
+
+    # 5) Threshold and symmetrize.
+    keep = freq >= float(consensus_threshold)
+    if keep.sum() == 0:
+        raise RuntimeError(
+            "No consensus MNN edges survived consensus_threshold. "
+            "Try lowering consensus_threshold or increasing n_projections."
+        )
+
+    rows = (uniq_keys[keep] // n).astype(np.int64)
+    cols = (uniq_keys[keep] % n).astype(np.int64)
+    w_expr = freq[keep].astype(np.float32)
+
+    Wa = coo_matrix((w_expr, (rows, cols)),
+                    shape=(n, n), dtype=np.float32).tocsr()
+    Wa.sum_duplicates()
+    Wa.setdiag(0.0)
+    Wa.eliminate_zeros()
+    Wa = (Wa + Wa.T) * 0.5
+    Wa.eliminate_zeros()
+    return Wa
 
 
 # ============================================================
@@ -342,6 +447,9 @@ def prime_st(
     # Embedding + solver
     n_comps: int = 30,
     svd_dim_for_ctx: int = 50,
+    # Projection method for the context (Z_gate) and base (Z0) embeddings
+    context_method: str = "svd",            # "svd" or "random_projection"
+    base_embedding_method: str = "svd",     # "svd" or "random_projection" (experimental)
     lambda_anchor: float = 5.0,
     lambda_spatial: float = 1.0,
     solver_tol: float = 1e-5,
@@ -365,6 +473,27 @@ def prime_st(
     where L_a is the graph Laplacian of an ERP-consensus MNN anchor graph
     (across batches) and L_s is the Laplacian of within-batch spatial kNN graphs.
     Z0 is the TruncatedSVD embedding of HVG-only log1p data.
+
+    The anchor graph (L_a) is always built by ensemble random projection +
+    consensus MNN (see :func:`_build_rp_consensus_mnn_graph`); random projection
+    is the natural choice there because MNN is distance-based and the
+    Johnson-Lindenstrauss lemma makes random projection approximately
+    distance-preserving.
+
+    Projection-method controls
+    --------------------------
+    context_method : {"svd", "random_projection"}, default "svd"
+        Dimensionality reduction used for the *context* embedding ``Z_gate``,
+        which drives expression-distance gating of the spatial graph and
+        spatial-context reweighting of anchors. ``"random_projection"`` swaps
+        SVD for a distance-preserving Gaussian projection.
+    base_embedding_method : {"svd", "random_projection"}, default "svd"
+        Dimensionality reduction for the solver's right-hand side ``Z0``.
+        Keep ``"svd"`` unless you specifically want speed over embedding
+        stability: SVD/PCA ranks components by biological variance and denoises,
+        whereas random projection preserves distances but does not order
+        components by variance, so it changes the embedding objective.
+        **Experimental.**
     """
 
     if copy:
@@ -374,6 +503,10 @@ def prime_st(
         raise ValueError(f"{batch_key} not in adata.obs")
     if spatial_key not in adata.obsm:
         raise ValueError(f"{spatial_key} not in adata.obsm")
+    if context_method not in ("svd", "random_projection"):
+        raise ValueError("context_method must be 'svd' or 'random_projection'")
+    if base_embedding_method not in ("svd", "random_projection"):
+        raise ValueError("base_embedding_method must be 'svd' or 'random_projection'")
 
     batch_labels = adata.obs[batch_key].values
     spatial_coords = np.asarray(adata.obsm[spatial_key])
@@ -397,12 +530,34 @@ def prime_st(
     X_base = adata.layers[layer] if (layer is not None and layer in adata.layers) else adata.X
     X_log_hvg = _row_norm_log1p(X_base, target_sum=target_sum)[:, hvg_mask]
 
-    # ---- 3) Base SVD embeddings ----
-    Z_ctx = _svd_embedding(X_log_hvg,
-                           n_comps=max(svd_dim_for_ctx, n_comps),
-                           random_state=random_state)
-    Z0 = Z_ctx[:, :n_comps].copy()
-    Z_gate = Z_ctx[:, :svd_dim_for_ctx].copy()
+    # ---- 3) Base embeddings (Z0 and Z_gate) ----
+    # Z0     : baseline biological embedding, the right-hand side of the solver.
+    # Z_gate : context embedding for expression gating of the spatial graph and
+    #          for spatial-context reweighting of anchors.
+    # The SVD is computed once and shared whenever either embedding needs it
+    # (the default for both).
+    need_svd = (base_embedding_method == "svd") or (context_method == "svd")
+    Z_svd = (
+        _svd_embedding(X_log_hvg,
+                       n_comps=max(svd_dim_for_ctx, n_comps),
+                       random_state=random_state)
+        if need_svd else None
+    )
+
+    # Z0 defaults to SVD/PCA: it ranks components by biological variance and
+    # denoises, which is what the solver target should be. Random projection is
+    # available but experimental — it preserves distances yet does not order
+    # components by variance, so it changes the embedding objective.
+    if base_embedding_method == "random_projection":
+        Z0 = _random_projection_embedding(X_log_hvg, n_comps, random_state)
+    else:
+        Z0 = Z_svd[:, :n_comps].copy()
+
+    # Z_gate may use SVD (default) or a distance-preserving random projection.
+    if context_method == "random_projection":
+        Z_gate = _random_projection_embedding(X_log_hvg, svd_dim_for_ctx, random_state)
+    else:
+        Z_gate = Z_svd[:, :svd_dim_for_ctx].copy()
 
     # ---- 4) Within-batch spatial graph ----
     Ws = _build_spatial_graph(
@@ -415,57 +570,41 @@ def prime_st(
     )
 
     # ---- 5) ERP consensus MNN anchor graph ----
-    X_norm = normalize(X_log_hvg, axis=1)  # L2-normalize rows; keeps sparsity
-    keys_all = []
-    for t in range(n_projections):
-        rp = GaussianRandomProjection(n_components=rp_dim,
-                                      random_state=random_state + t)
-        Xp = rp.fit_transform(X_norm)  # dense (n, rp_dim)
+    # Ensemble random projection + consensus MNN — the prime.core principle,
+    # delegated to a reusable helper. Returns a symmetric, self-loop-free CSR
+    # anchor graph whose edge weights are consensus frequencies.
+    Wa = _build_rp_consensus_mnn_graph(
+        X_log_hvg, batch_labels,
+        n_projections=n_projections,
+        rp_dim=rp_dim,
+        k_mnn=k_mnn,
+        consensus_threshold=consensus_threshold,
+        mnn_strategy=mnn_strategy,
+        n_jobs=n_jobs,
+        random_state=random_state,
+    )
 
-        r, c = _multibatch_mnn_edges(
-            Xp, batch_labels,
-            k=k_mnn, strategy=mnn_strategy, n_jobs=n_jobs,
-        )
-        if r.size > 0:
-            keys_all.append(r.astype(np.int64) * n + c.astype(np.int64))
+    # Optional spatial-context reweighting, applied after the anchor edges are
+    # built: each anchor (r, c) is down-weighted when the two spots sit in
+    # dissimilar spatial neighbourhoods. RBF similarity is symmetric, so the
+    # reweighted graph remains symmetric and self-loop-free.
+    if reweight_anchors_by_spatial_context and Ws.nnz > 0 and Wa.nnz > 0:
+        Wa_coo = Wa.tocoo()
+        rows = Wa_coo.row.astype(np.int64)
+        cols = Wa_coo.col.astype(np.int64)
+        w_expr = Wa_coo.data.astype(np.float32)
 
-    if not keys_all:
-        raise RuntimeError(
-            "No MNN edges found across projections. "
-            "Try increasing k_mnn, lowering consensus_threshold, "
-            "or using mnn_strategy='pairwise'."
-        )
-
-    all_keys = np.concatenate(keys_all)
-    uniq_keys, counts = np.unique(all_keys, return_counts=True)
-    freq = counts.astype(np.float32) / float(n_projections)
-
-    keep = freq >= float(consensus_threshold)
-    if keep.sum() == 0:
-        raise RuntimeError(
-            "No consensus MNN edges survived consensus_threshold. "
-            "Try lowering consensus_threshold or increasing n_projections."
-        )
-
-    rows = (uniq_keys[keep] // n).astype(np.int64)
-    cols = (uniq_keys[keep] % n).astype(np.int64)
-    w_expr = freq[keep].astype(np.float32)
-
-    # Optional spatial-context reweighting of anchors
-    if reweight_anchors_by_spatial_context and Ws.nnz > 0:
         S = _spatial_context_from_graph(Ws, Z_gate)
         w_ctx = _rbf_similarity(S, rows, cols)
         w_anchor = w_expr * (w_ctx ** float(spatial_power))
-    else:
-        w_anchor = w_expr
 
-    Wa = coo_matrix((w_anchor, (rows, cols)),
-                    shape=(n, n), dtype=np.float32).tocsr()
-    Wa.sum_duplicates()
-    Wa.setdiag(0.0)
-    Wa.eliminate_zeros()
-    Wa = (Wa + Wa.T) * 0.5
-    Wa.eliminate_zeros()
+        Wa = coo_matrix((w_anchor, (rows, cols)),
+                        shape=(n, n), dtype=np.float32).tocsr()
+        Wa.sum_duplicates()
+        Wa.setdiag(0.0)
+        Wa.eliminate_zeros()
+        Wa = (Wa + Wa.T) * 0.5
+        Wa.eliminate_zeros()
 
     if verbose:
         sc.logging.info(
@@ -495,11 +634,16 @@ def prime_st(
             "W_anchor": Wa,
             "W_spatial": Ws,
             "n_hvg": int(hvg_mask.sum()),
+            "anchor_projection_method": "random_projection",
+            "context_method": context_method,
+            "base_embedding_method": base_embedding_method,
             "n_projections": int(n_projections),
             "rp_dim": int(rp_dim),
+            "svd_dim_for_ctx": int(svd_dim_for_ctx),
             "k_mnn": int(k_mnn),
             "consensus_threshold": float(consensus_threshold),
             "mnn_strategy": mnn_strategy,
+            "random_state": int(random_state),
             "lambda_anchor": float(lambda_anchor),
             "lambda_spatial": float(lambda_spatial),
             "reweight_anchors_by_spatial_context": bool(reweight_anchors_by_spatial_context),
