@@ -15,7 +15,13 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from prime.gpu._backend import detect, free_pool, pick_knn_backend, require_ann
+from prime.gpu._backend import (
+    detect,
+    free_pool,
+    is_oom_error,
+    pick_knn_backend,
+    require_ann,
+)
 
 
 def _to_gpu_fp32(arr):
@@ -60,8 +66,16 @@ def chunked_knn(
     chunk_size: int = 50_000,
     backend: str = "auto",
     free_between_chunks: bool = True,
+    min_chunk_size: int = 1024,
 ) -> np.ndarray:
     """Find k nearest neighbors in ``data`` for each row of ``queries``.
+
+    The query side is processed in chunks of at most ``chunk_size`` rows. If a
+    chunk triggers a GPU out-of-memory error, the chunk size is halved and the
+    *same* chunk is retried, down to ``min_chunk_size``; only if a chunk that
+    small still cannot fit is the error re-raised. This makes the query-side
+    VRAM footprint self-adapting rather than crashing on the first chunk that is
+    too large for the currently free VRAM.
 
     Parameters
     ----------
@@ -72,18 +86,29 @@ def chunked_knn(
     k
         Number of neighbors to return.
     chunk_size
-        Maximum number of query rows processed per ANN call. Lower this
-        if VRAM is tight; raise for throughput.
+        Maximum number of query rows processed per ANN call, used as the
+        *starting* size. Lower it if VRAM is tight; raise for throughput. It is
+        reduced automatically on OOM (see ``min_chunk_size``).
     backend
         ``"auto"`` (cuvs > faiss), ``"cuvs"``, or ``"faiss"``.
     free_between_chunks
         Release cupy's memory pool between query chunks. Prevents
         fragmentation-driven OOM on long-running pipelines.
+    min_chunk_size
+        Smallest query chunk the adaptive backoff will fall to before giving up
+        and re-raising the OOM. Defaults to 1024.
 
     Returns
     -------
     np.ndarray (int64, shape=(n_query, k))
         Neighbor indices in ``data``. Returned on CPU.
+
+    Raises
+    ------
+    MemoryError
+        If a chunk of ``min_chunk_size`` rows still does not fit in VRAM. The
+        index side (``data``) and ``k`` dominate what is left; reduce
+        ``target_dim``/``k`` or use a larger-VRAM GPU.
     """
     env = require_ann()
     backend = pick_knn_backend(backend, env)
@@ -94,20 +119,42 @@ def chunked_knn(
     n_query = queries.shape[0]
     out = np.empty((n_query, int(k)), dtype=np.int64)
 
-    for s in range(0, n_query, int(chunk_size)):
-        e = min(s + int(chunk_size), n_query)
-        q_gpu = _to_gpu_fp32(queries[s:e])
+    cur_chunk = max(1, int(chunk_size))
+    floor = max(1, min(int(min_chunk_size), cur_chunk))
 
-        if backend == "cuvs":
-            idx_gpu = _cuvs_search(data_gpu, q_gpu, k=int(k))
-        else:
-            idx_gpu = _faiss_search(data_gpu, q_gpu, k=int(k))
-
-        out[s:e] = cp.asnumpy(idx_gpu).astype(np.int64, copy=False)
-
+    s = 0
+    while s < n_query:
+        e = min(s + cur_chunk, n_query)
+        q_gpu = idx_gpu = None
+        try:
+            q_gpu = _to_gpu_fp32(queries[s:e])
+            if backend == "cuvs":
+                idx_gpu = _cuvs_search(data_gpu, q_gpu, k=int(k))
+            else:
+                idx_gpu = _faiss_search(data_gpu, q_gpu, k=int(k))
+            out[s:e] = cp.asnumpy(idx_gpu).astype(np.int64, copy=False)
+        except Exception as exc:  # noqa: BLE001 — re-raised below unless OOM
+            if not is_oom_error(exc):
+                raise
+            # Drop partial allocations from the failed attempt, reclaim VRAM,
+            # and retry the SAME chunk with a smaller size.
+            del q_gpu, idx_gpu
+            free_pool()
+            if cur_chunk <= floor:
+                raise MemoryError(
+                    f"GPU out of memory in chunked_knn even at "
+                    f"chunk_size={cur_chunk} (k={k}, "
+                    f"n_index={int(data_gpu.shape[0])}, "
+                    f"dim={int(data_gpu.shape[1])}). Reduce target_dim or k, "
+                    f"set projection_dtype='float16', or use a larger-VRAM GPU."
+                ) from exc
+            cur_chunk = max(floor, cur_chunk // 2)
+            continue  # retry [s, s + cur_chunk) without advancing s
+        # Success: release this chunk's buffers and advance.
         del q_gpu, idx_gpu
         if free_between_chunks:
             free_pool()
+        s = e
 
     del data_gpu
     if free_between_chunks:
