@@ -22,21 +22,61 @@ Two main entry points cover both modalities:
 
 ## Installation
 
-Clone the repository and install in editable mode:
+### Option A — conda / mamba (recommended)
+
+The repository ships ready-to-use environment files. From a clone of the repo:
 
 ```bash
 git clone https://github.com/XinchaoWu99/PRIME.git
 cd PRIME
-pip install -e .
+
+# CPU / base environment (Linux, macOS, Windows)
+conda env create -f environment.yml      # or: mamba env create -f environment.yml
+conda activate prime
 ```
 
-To include optional plotting and evaluation extras:
+`environment.yml` pulls the full scientific stack from conda-forge and then
+installs PRIME itself in editable mode, so `import prime` works immediately.
+Run the command **from the repository root** (so the `-e .` step resolves to
+this repo). [`mamba`](https://mamba.readthedocs.io/) is a faster drop-in
+replacement for `conda` and is recommended — especially for the GPU
+environment below.
+
+### Option B — pip
 
 ```bash
-pip install -e ".[all]"
+git clone https://github.com/XinchaoWu99/PRIME.git
+cd PRIME
+pip install -e .                 # core
+pip install -e ".[all]"          # + plotting & metrics extras
 ```
 
 **Requirements:** Python ≥ 3.9, NumPy, Pandas, SciPy, scikit-learn, AnnData, Scanpy.
+
+### GPU backend (optional, NVIDIA only)
+
+The VRAM-bounded GPU path (`prime.gpu.ensemble_mnn_correct`) additionally needs
+cupy and a GPU ANN backend (cuvs or faiss-gpu), and a **Linux machine with an
+NVIDIA GPU**. The simplest route is the dedicated environment file — edit its
+`cuda-version` to match your driver (`nvidia-smi`) first:
+
+```bash
+mamba env create -f environment-gpu.yml
+conda activate prime-gpu
+python -c "import prime.gpu; print(prime.gpu.detect())"
+```
+
+Or layer it onto an existing install with pip, picking a cupy wheel that matches
+your CUDA version:
+
+```bash
+pip install cupy-cuda12x
+pip install "prime-sc[gpu-cuvs]"     # recommended
+# or
+pip install "prime-sc[gpu-faiss]"
+```
+
+See [Scaling to 1M+ cells](#scaling-to-1m-cells) for GPU usage.
 
 ---
 
@@ -267,7 +307,7 @@ X_corrected = prime.gpu.ensemble_mnn_correct(
 adata.layers["prime_gpu"] = X_corrected
 ```
 
-**Installation.** Install the matching cupy wheel for your CUDA version plus one ANN backend:
+**Installation.** Use the dedicated GPU environment (`environment-gpu.yml`, Linux + NVIDIA only) — see [Installation → GPU backend](#gpu-backend-optional-nvidia-only). Or layer it onto an existing environment with a cupy wheel matching your CUDA version plus one ANN backend:
 
 ```bash
 pip install cupy-cuda12x
